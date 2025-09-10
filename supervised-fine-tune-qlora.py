@@ -1,0 +1,711 @@
+# Written by Peibo Li
+# Original code based on https://github.com/dvlab-research/LongLoRA?tab=readme-ov-file
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import io
+import os
+import copy
+import json
+import math
+import logging
+import random
+import re
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Sequence
+
+import torch
+import torch.nn as nn
+import transformers
+from torch.utils.data import Dataset
+from transformers import Trainer, DataCollatorForLanguageModeling, BitsAndBytesConfig
+from llama_attn_replace_sft import replace_llama_attn
+#from gptneox_attn_replace import replace_gpt_neox_attn
+from peft import LoraConfig, get_peft_model
+from torch.distributed import barrier
+
+IGNORE_INDEX = -100
+DEFAULT_PAD_TOKEN = "[PAD]"
+DEFAULT_EOS_TOKEN = "</s>"
+DEFAULT_BOS_TOKEN = "<s>"
+DEFAULT_UNK_TOKEN = "<unk>"
+os.environ["WANDB_DISABLED"]="true"
+
+def _make_r_io_base(f, mode: str):
+    if not isinstance(f, io.IOBase):
+        f = open(f, mode=mode)
+    return f
+
+def jload(f, mode="r"):
+    """Load a .json file into a dictionary."""
+    f = _make_r_io_base(f, mode)
+    jdict = json.load(f)
+    f.close()
+    return jdict
+
+PROMPT_DICT = {
+    "prompt_input": (
+        "Below is an instruction that describes a task, paired with an input that provides further context. "
+        "Write a response that appropriately completes the request.\n\n"
+        "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:"
+    ),
+    "prompt_no_input": (
+        "Below is an instruction that describes a task. "
+        "Write a response that appropriately completes the request.\n\n"
+        "### Instruction:\n{instruction}\n\n### Response:"
+    ),
+    "prompt_no_input_llama2":(
+        "<s>[INST] <<SYS>>\n"
+        "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\n"
+        "If a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information.\n"
+        "<</SYS>> \n\n {instruction} [/INST]"
+    ),
+    "prompt_input_llama2": (
+        "<s>[INST] <<SYS>>\n"
+        "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\n"
+        "If a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information.\n"
+        "<</SYS>> \n\n {instruction} \n{input} [/INST]"
+    )
+}
+
+
+@dataclass
+class ModelArguments:
+    model_name_or_path: Optional[str] = field(default="./Llama-3.1-8B")
+    model_type: Optional[str] = field(default="llama")
+
+
+@dataclass
+class DataArguments:
+    data_path: str = field(default="datasets/NYC/train_codebook.json", metadata={"help": "Path to the training data."})
+
+
+@dataclass
+class TrainingArguments(transformers.TrainingArguments):
+    cache_dir: Optional[str] = field(default=None)
+    optim: str = field(default="adamw_torch")
+    model_max_length: int = field(
+        default=2048,
+        metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
+    )
+    use_flash_attn: bool = field(
+        default=True,
+        metadata={"help": "Whether use flash attention for training."},
+    )
+    use_full_attn: bool = field(
+        default=False,
+        metadata={"help": "Whether to use plain, full-attention for training."},
+    )
+    low_rank_training: bool = field(
+        default=True,
+        metadata={"help": "Whether use low rank adaptation for training."},
+    )
+    trainable_params: str = field(
+        default="embed,norm",
+        metadata={"help": "Additional trainable parameters except LoRA weights, if low rank training."},
+    )
+    output_dir: str = field(
+        default="./output",
+        metadata={"help": "The output directory where the model predictions and checkpoints will be written."},
+    )
+    bf16: bool = field(
+        default=True,
+        metadata={"help": "Whether to use bf16 (mixed) precision instead of 32-bit."},
+    )
+    num_train_epochs: float = field(
+        default=3,
+        metadata={"help": "Total number of training epochs to perform."},
+    )
+    per_device_train_batch_size: int = field(
+        default=2,
+        metadata={"help": "Batch size per GPU/TPU core/CPU for training."},
+    )
+    per_device_eval_batch_size: int = field(
+        default=4,
+        metadata={"help": "Batch size per GPU/TPU core/CPU for evaluation."},
+    )
+    gradient_accumulation_steps: int = field(
+        default=8,
+        metadata={"help": "Number of updates steps to accumulate before performing a backward/update pass."},
+    )
+    evaluation_strategy: str = field(
+        default="no",
+        metadata={"help": "The evaluation strategy to use."},
+    )
+    save_strategy: str = field(
+        default="steps",
+        metadata={"help": "The checkpoint save strategy to use."},
+    )
+    save_steps: int = field(
+        default=1000,
+        metadata={"help": "Save checkpoint every X updates steps."},
+    )
+    save_total_limit: int = field(
+        default=5,
+        metadata={"help": "Limit the total amount of checkpoints."},
+    )
+    learning_rate: float = field(
+        default=1e-5,
+        metadata={"help": "The initial learning rate for AdamW."},
+    )
+    weight_decay: float = field(
+        default=0.0,
+        metadata={"help": "Weight decay for AdamW if we apply some."},
+    )
+    warmup_steps: int = field(
+        default=20,
+        metadata={"help": "Linear warmup over warmup_steps."},
+    )
+    lr_scheduler_type: str = field(
+        default="constant_with_warmup",
+        metadata={"help": "The scheduler type to use."},
+    )
+    logging_steps: int = field(
+        default=1,
+        metadata={"help": "Log every X updates steps."},
+    )
+    tf32: bool = field(
+        default=True,
+        metadata={"help": "Whether to enable tf32 mode."},
+    )
+    deepspeed: str = field(
+        default="ds_configs/stage2.json",
+        metadata={"help": "Enable deepspeed and pass the path to deepspeed json config file."},
+    )
+    
+def extract_semantic_sequences(text):
+    """
+    从文本中提取所有可能的语义ID序列
+    
+    Args:
+        text: 要分析的文本
+        
+    Returns:
+        set: 包含所有找到的语义ID序列的集合
+    """
+    # 使用正则表达式提取连续的语义ID序列
+    pattern = r'(<[a-z]_\d+>)+'
+    
+    # 找出所有连续的语义ID序列
+    full_sequences = []
+    current_pos = 0
+    while True:
+        match = re.search(pattern, text[current_pos:])
+        if not match:
+            break
+        
+        start, end = match.span()
+        sequence = text[current_pos + start:current_pos + end]
+        full_sequences.append(sequence)
+        current_pos += end
+    
+    return set(full_sequences)
+
+def smart_tokenizer_and_embedding_resize(
+    special_tokens_dict: Dict,
+    tokenizer: transformers.PreTrainedTokenizer,
+    model: transformers.PreTrainedModel,
+    data_path: str = None,
+):
+    """Resize tokenizer and embedding.
+
+    Note: This is the unoptimized version that may make your embedding size not be divisible by 64.
+    """
+    # 添加基本特殊标记
+    num_new_tokens = tokenizer.add_special_tokens(special_tokens_dict)
+    print(f"添加了 {num_new_tokens} 个基本特殊标记")
+    
+    # 从数据集中提取语义ID并添加
+    if data_path:
+        data = jload(data_path)
+        all_ids = set()
+        
+        print(f"从数据集 {data_path} 中提取语义ID序列...")
+        print(f"数据集中共有 {len(data)} 个样本")
+        
+        # 从所有样本中收集语义ID
+        for item in data:
+            # 分别提取input和output字段的内容
+            input_text = item.get("input", "")
+            output_text = item.get("output", "")
+            
+            # 从各个字段中提取语义ID序列
+            input_ids = extract_semantic_sequences(input_text)
+            output_ids = extract_semantic_sequences(output_text)
+            
+            all_ids.update(input_ids)
+            all_ids.update(output_ids)
+        
+        # 添加语义ID序列到词汇表
+        if all_ids:
+            semantic_tokens = sorted(list(all_ids))
+            print(f"找到 {len(semantic_tokens)} 个不同的语义ID序列")
+            if len(semantic_tokens) > 0:
+                print(f"前5个语义ID序列示例: {semantic_tokens[:min(5, len(semantic_tokens))]}")
+            
+            # 检查这些序列是否已经在词汇表中
+            new_tokens = []
+            for token in semantic_tokens:
+                if token not in tokenizer.get_vocab():
+                    new_tokens.append(token)
+            
+            if new_tokens:
+                print(f"添加 {len(new_tokens)} 个新的语义ID序列到词汇表")
+                num_semantic_tokens = tokenizer.add_tokens(new_tokens)
+                num_new_tokens += num_semantic_tokens
+                print(f"实际添加了 {num_semantic_tokens} 个新token")
+            else:
+                print("所有语义ID序列已经在词汇表中")
+        else:
+            print("未找到任何语义ID序列")
+    
+    # 调整模型的词嵌入大小
+    model.resize_token_embeddings(len(tokenizer))
+    print(f"调整后的词汇表大小: {len(tokenizer)}")    
+    # 初始化新添加的嵌入
+    if num_new_tokens > 0:
+        input_embeddings = model.get_input_embeddings().weight.data
+        output_embeddings = model.get_output_embeddings().weight.data
+
+        input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
+        output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
+
+        input_embeddings[-num_new_tokens:] = input_embeddings_avg
+        output_embeddings[-num_new_tokens:] = output_embeddings_avg
+
+
+def _tokenize_fn(strings: Sequence[str], tokenizer: transformers.PreTrainedTokenizer) -> Dict:
+    """Tokenize a list of strings."""
+    tokenized_list = [
+        tokenizer(
+            text,
+            return_tensors="pt",
+            padding="longest",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+            # 确保不跳过special token
+            add_special_tokens=True,  # 添加特殊标记
+        )
+        for text in strings
+    ]
+    
+    # 打印第一个样本的分词结果
+    if len(strings) > 0:
+        print("\n=== 第一个样本的分词结果 ===")
+        print(f"原始文本: {strings[0]}")
+        print(f"分词后的token IDs: {tokenized_list[0].input_ids[0]}")
+        # 将token IDs转换回对应的token
+        tokens = tokenizer.convert_ids_to_tokens(tokenized_list[0].input_ids[0])
+        print(f"分词后的tokens: {tokens}")
+        
+        # 提取并检查语义ID序列
+        sequences = extract_semantic_sequences(strings[0])
+        if sequences:
+            print("\n语义ID序列在分词结果中的位置:")
+            for seq in sequences:
+                # 检查序列在原始文本中的位置
+                start_pos = strings[0].find(seq)
+                if start_pos != -1:
+                    print(f"序列 '{seq}' 在原始文本中的位置: {start_pos}")
+                    
+                    # 检查序列是否作为单个token出现
+                    if seq in tokenizer.get_vocab():
+                        seq_id = tokenizer.convert_tokens_to_ids(seq)
+                        if seq_id in tokenized_list[0].input_ids[0]:
+                            indices = (tokenized_list[0].input_ids[0] == seq_id).nonzero(as_tuple=True)[0]
+                            print(f"  作为单个token出现在位置: {indices.tolist()}")
+                        else:
+                            print(f"  未作为单个token出现在分词结果中")
+                    else:
+                        print(f"  不是词汇表中的单个token")
+        
+        print("===========================\n")
+    
+    input_ids = labels = [tokenized.input_ids[0] for tokenized in tokenized_list]
+    input_ids_lens = labels_lens = [
+        tokenized.input_ids.ne(tokenizer.pad_token_id).sum().item() for tokenized in tokenized_list
+    ]
+    return dict(
+        input_ids=input_ids,
+        labels=labels,
+        input_ids_lens=input_ids_lens,
+        labels_lens=labels_lens,
+    )
+
+
+def preprocess(
+    sources: Sequence[str],
+    targets: Sequence[str],
+    tokenizer: transformers.PreTrainedTokenizer,
+) -> Dict:
+    """Preprocess the data by tokenizing."""
+    # 打印第一个样本的source和target
+    if len(sources) > 0 and len(targets) > 0:
+        print("\n=== 第一个样本的原始数据 ===")
+        print(f"Source: {sources[0]}")
+        print(f"Target: {targets[0]}")
+        
+        # 提取语义ID序列
+        source_ids = extract_semantic_sequences(sources[0])
+        target_ids = extract_semantic_sequences(targets[0])
+        print(f"Source中的语义ID序列: {source_ids}")
+        print(f"Target中的语义ID序列: {target_ids}")
+        
+        # 检查语义ID序列的分词情况
+        if target_ids:
+            print("\n语义ID序列的分词情况:")
+            for seq in target_ids:
+                # 直接对序列进行分词
+                tokens = tokenizer.tokenize(seq)
+                token_ids = tokenizer.convert_tokens_to_ids(tokens)
+                print(f"序列 '{seq}':")
+                print(f"  分词结果: {tokens}")
+                print(f"  Token IDs: {token_ids}")
+                
+                # 检查是否作为单个token
+                if seq in tokenizer.get_vocab():
+                    single_id = tokenizer.convert_tokens_to_ids(seq)
+                    print(f"  作为单个token的ID: {single_id}")
+                else:
+                    print(f"  不是单个token")
+        
+        print("===========================\n")
+    
+    examples = [s + t for s, t in zip(sources, targets)]
+    examples_tokenized, sources_tokenized = [_tokenize_fn(strings, tokenizer) for strings in (examples, sources)]
+    input_ids = examples_tokenized["input_ids"]
+    labels = copy.deepcopy(input_ids)
+    for label, source_len in zip(labels, sources_tokenized["input_ids_lens"]):
+        label[:source_len] = IGNORE_INDEX
+    return dict(input_ids=input_ids, labels=labels)
+
+
+class SupervisedDataset(Dataset):
+    """Dataset for supervised fine-tuning."""
+
+    def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer):
+        super(SupervisedDataset, self).__init__()
+        logging.warning("Loading data...")
+        list_data_dict = jload(data_path)
+
+        logging.warning("Formatting inputs...")
+
+        sources = []
+        targets = []
+        
+        # 使用instruction/input/output格式，并应用<question>:/<answer>:格式
+        for example in list_data_dict:
+            # 构建source部分，使格式与target一致
+            instruction = example["instruction"].strip()
+            source = f" <question> : {instruction}"
+            
+            # 如果有input字段且不为空，添加到source
+            if example.get("input", "").strip():
+                input_text = example["input"].strip()
+                source = f"{source}\n\n{input_text}"
+            
+            # 构建target部分，修改格式以便模型学习正确输出
+            output = example["output"].strip()
+            # 确保输出格式一致，使用明确的空格分隔
+            target = f" <answer> : {output}{tokenizer.eos_token}"
+            sources.append(source)
+            targets.append(target)
+        
+        # 添加调试信息，显示几个样本的格式和语义ID序列
+        if len(sources) > 0:
+            print(f"\n=== 训练数据格式示例 ===")
+            for i in range(min(3, len(sources))):
+                print(f"样本 {i+1}:")
+                print(f"  Source: {sources[i]}")
+                print(f"  Target: {targets[i]}")
+                
+                # 提取并显示语义ID序列
+                source_sequences = extract_semantic_sequences(sources[i])
+                target_sequences = extract_semantic_sequences(targets[i])
+                
+                print(f"  Source中的语义ID序列: {source_sequences}")
+                print(f"  Target中的语义ID序列: {target_sequences}")
+                
+                # 检查这些序列是否在词汇表中
+                for seq in target_sequences:
+                    if seq in tokenizer.get_vocab():
+                        print(f"  序列 '{seq}' 在词汇表中，ID为: {tokenizer.convert_tokens_to_ids(seq)}")
+                    else:
+                        print(f"  序列 '{seq}' 不在词汇表中!")
+                
+                print()
+            print("========================\n")
+            
+        logging.warning("Tokenizing inputs... This may take some time...")
+        data_dict = preprocess(sources, targets, tokenizer)
+
+        self.input_ids = data_dict["input_ids"]
+        self.labels = data_dict["labels"]
+
+    def __len__(self):
+        return len(self.input_ids)
+
+    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+        return dict(input_ids=self.input_ids[i], labels=self.labels[i])
+
+
+@dataclass
+class DataCollatorForSupervisedDataset(object):
+    """Collate examples for supervised fine-tuning."""
+
+    tokenizer: transformers.PreTrainedTokenizer
+
+    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+        input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
+        )
+        labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
+        return dict(
+            input_ids=input_ids,
+            labels=labels,
+            attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
+        )
+
+
+def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
+    """Make dataset and collator for supervised fine-tuning."""
+    train_dataset = SupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path)
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+    return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+
+
+def train():
+    parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
+    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    # NOTE: May expand supported model types in the future
+    if model_args.model_type == "gpt-neox":
+        replace_gpt_neox_attn(training_args.use_flash_attn, training_args.use_full_attn)
+    else:
+        replace_llama_attn(training_args.use_flash_attn, training_args.use_full_attn, inference=False)
+
+    # Set RoPE scaling factor
+    config = transformers.AutoConfig.from_pretrained(
+        model_args.model_name_or_path,
+        cache_dir=training_args.cache_dir
+    )
+    
+    # 补充并行相关字段，防止 NoneType 报错
+    if not hasattr(config, "tp_parallel") or config.tp_parallel is None:
+        config.tp_parallel = "none"
+    if not hasattr(config, "model_parallel_style") or config.model_parallel_style is None:
+        config.model_parallel_style = "none"
+
+    orig_ctx_len = getattr(config, "max_position_embeddings", None)
+    if orig_ctx_len and training_args.model_max_length > orig_ctx_len:
+        scaling_factor = float(math.ceil(training_args.model_max_length / orig_ctx_len))
+        config.rope_scaling = {"type": "linear", "factor": scaling_factor}
+    else:
+        config.rope_scaling = {"type": "linear", "factor": 1.0}
+
+    # Load model and tokenizer
+    model = transformers.AutoModelForCausalLM.from_pretrained(
+        model_args.model_name_or_path,
+        config=config,
+        cache_dir=training_args.cache_dir,
+        torch_dtype=torch.bfloat16,
+        quantization_config=BitsAndBytesConfig(
+            load_in_4bit=True,
+            llm_int8_threshold=6.0,
+            llm_int8_has_fp16_weight=False,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        ),
+    )
+
+    for param in model.parameters():
+        param.requires_grad = False  # freeze the model - train adapters later
+        if param.ndim == 1:
+            # cast the small parameters (e.g. layernorm) to fp32 for stability
+            param.data = param.data.to(torch.float32)
+
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
+        model_args.model_name_or_path,
+        cache_dir=training_args.cache_dir,
+        model_max_length=training_args.model_max_length,
+        padding_side="right",
+        use_fast=True,
+    )
+
+    special_tokens_dict = dict()
+    if tokenizer.pad_token is None:
+        special_tokens_dict["pad_token"] = DEFAULT_PAD_TOKEN
+    if tokenizer.eos_token is None:
+        special_tokens_dict["eos_token"] = DEFAULT_EOS_TOKEN
+    if tokenizer.bos_token is None:
+        special_tokens_dict["bos_token"] = DEFAULT_BOS_TOKEN
+    if tokenizer.unk_token is None:
+        special_tokens_dict["unk_token"] = DEFAULT_UNK_TOKEN
+
+    smart_tokenizer_and_embedding_resize(
+        special_tokens_dict=special_tokens_dict,
+        tokenizer=tokenizer,
+        model=model,
+        data_path=data_args.data_path,
+    )
+
+    data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
+    
+    # 创建自定义的Trainer类，覆盖compute_loss方法以打印预测正确的情况
+    class CustomTrainer(Trainer):
+        def compute_loss(self, model, inputs, return_outputs=False):
+            # 调用原始的compute_loss获取输出
+            outputs = model(**inputs)
+            loss = outputs.loss
+            
+            # 对每个批次都进行检查
+            logits = outputs.logits
+            batch_size = inputs["input_ids"].shape[0]  # 获取实际批次大小
+            
+            # 检查批次中的所有样本
+            for i in range(batch_size):
+                # 为当前样本提取数据
+                sample_input_ids = inputs["input_ids"][i].cpu().numpy()
+                sample_labels = inputs["labels"][i].cpu().numpy()
+                sample_predictions = torch.argmax(logits[i], dim=-1).cpu().numpy()
+                
+                # 找出标签中不是-100的部分（实际需要预测的部分）
+                valid_label_indices = sample_labels != -100
+                valid_labels = sample_labels[valid_label_indices]
+                
+                # 获取相应位置的预测
+                valid_predictions = sample_predictions[valid_label_indices]
+                
+                # 将token ID转换为文本
+                tokenizer = self.tokenizer
+                
+                # 将完整输入转换为文本
+                full_input_text = tokenizer.decode(sample_input_ids, skip_special_tokens=True)
+                
+                # 将真实标签和预测转换为文本
+                label_text = tokenizer.decode(valid_labels, skip_special_tokens=True)
+                prediction_text = tokenizer.decode(valid_predictions, skip_special_tokens=True)
+                
+                print(f"预测文本: {prediction_text}")
+                print(f"标签文本: {label_text}")
+
+                # # 清理文本（删除多余空格和换行符）
+                # label_text = label_text.replace('\n', ' ').strip()
+                # prediction_text = prediction_text.replace('\n', ' ').strip()
+                
+                
+                # # 从标签中提取纯POI序列
+                # label_poi_parts = []
+                # label_poi_matches = re.findall(r'<([a-z])_(\d+)>', label_text)
+                # for type_char, value in label_poi_matches:
+                #     label_poi_parts.append(f"<{type_char}_{value}>")
+                
+                # label_poi_sequence = "".join(label_poi_parts)
+                
+                # # 从预测中提取纯POI序列
+                # pred_poi_parts = []
+                # pred_poi_matches = re.findall(r'<([a-z])_(\d+)>', prediction_text)
+                # for type_char, value in pred_poi_matches:
+                #     pred_poi_parts.append(f"<{type_char}_{value}>")
+                
+                # pred_poi_sequence = "".join(pred_poi_parts)
+                
+                # # 判断POI序列是否完全匹配
+                # is_exact_match = (label_poi_sequence == pred_poi_sequence) and label_poi_sequence != ""
+                
+                # # 只打印完全匹配的样本
+                # if is_exact_match:
+                #     # 从输入中提取指令和输入内容
+                #     if "<question>" in full_input_text:
+                #         question_match = re.search(r'<question>\s*:\s*(.*?)(?:<answer>|$)', full_input_text, re.DOTALL)
+                #         instruction = question_match.group(1).strip() if question_match else ""
+                #         input_content = ""
+                #     else:
+                #         # 如果没有找到POI，整个输入就是指令
+                #         instruction = full_input_text.strip()
+                #         input_content = ""
+                    
+                #     print("\n=== 预测完全正确的样本 ===")
+                #     print(f"批次位置: {i+1}/{batch_size}")
+                #     print(f"指令: {instruction}")
+                #     if input_content:
+                #         print(f"输入: {input_content}")
+                    
+                #     # 输出详细信息
+                #     print(f"标签文本: {label_text}")
+                #     print(f"预测文本: {prediction_text}")
+                #     print(f"标签POI序列: {label_poi_sequence}")
+                #     print(f"预测POI序列: {pred_poi_sequence}")
+                #     print("========================\n")
+            
+            if return_outputs:
+                return loss, outputs
+            return loss
+
+    if training_args.low_rank_training:
+        if model_args.model_type == "gpt-neox":
+            # added `dense` to match with llama as the basic LoRA would only target 'query_key_value'
+            targets = ["query_key_value", "dense"]
+        else:
+            targets=["q_proj", "k_proj", "v_proj", "o_proj"]
+
+        config = LoraConfig(
+            r=16,
+            lora_alpha=32,
+            target_modules=targets,
+            lora_dropout=0,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, config)
+        # enable trainable params
+        [p.requires_grad_() for n, p in model.named_parameters() if any([k in n for k in training_args.trainable_params.split(",")])]
+
+    class CastOutputToFloat(nn.Sequential):
+        def forward(self, x):
+            return super().forward(x).to(torch.float32)
+
+    model.lm_head = CastOutputToFloat(model.lm_head)
+
+    # Verifying the datatypes.
+    dtypes = {}
+    for _, p in model.named_parameters():
+        dtype = p.dtype
+        if dtype not in dtypes:
+            dtypes[dtype] = 0
+        dtypes[dtype] += p.numel()
+    total = 0
+    for k, v in dtypes.items():
+        total += v
+    for k, v in dtypes.items():
+        print(k, v, v / total)
+
+    model.config.use_cache = False         # required for gradient checkpointing
+    model.enable_input_require_grads()     # required for gradient checkpointing
+    model.gradient_checkpointing_enable()  # enable gradient checkpointing
+
+    # 使用自定义Trainer
+    trainer = CustomTrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+    trainer.train(resume_from_checkpoint=False)
+    trainer.save_state()
+    trainer.save_model(output_dir=training_args.output_dir)
+
+    # Save trainable parameters (embed and norm layers)
+    trainable_state_dict = {k: v.cpu() for k, v in model.named_parameters() if v.requires_grad}
+    torch.save(trainable_state_dict, os.path.join(training_args.output_dir, "trainable_params.bin"))
+    print(f"Trainable parameters saved to {os.path.join(training_args.output_dir, 'trainable_params.bin')}")
+
+if __name__ == "__main__":
+    train()
