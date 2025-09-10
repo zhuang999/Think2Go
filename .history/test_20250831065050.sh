@@ -1,5 +1,0 @@
-# CUDA_VISIBLE_DEVICES=2 nohup python eval_vllm.py --tensor_parallel_size 1 --model_path ./Llama-3.1-8B  --dataset_name nyc --output_dir ./output/checkpoint-500 --test_file "datasets/NYC/test_codebook.json" > output_reason/test-722-500-se5+1.txt 2>&1 &  
-
-
-CUDA_VISIBLE_DEVICES=0 nohup python eval_vllm.py --model_path ./Llama-3.1-8B  --dataset_name nyc --output_dir ./restart/checkpoint-7000 --test_file "datasets/NYC/data/test_codebook_origin.json" > restart/test-7000-1.txt 2>&1 &  
-
