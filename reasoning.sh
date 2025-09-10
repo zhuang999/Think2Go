@@ -22,7 +22,7 @@ torchrun --nproc_per_node=4 reasoning.py  \
 --use_flash_attn True \
 --data_path data/NYC/data/train_codebook_with_difficulty.json \
 --low_rank_training True \
---num_train_epochs 10  \
+--num_train_epochs 3  \
 --per_device_train_batch_size 1    \
 --per_device_eval_batch_size 2     \
 --gradient_accumulation_steps 1     \
