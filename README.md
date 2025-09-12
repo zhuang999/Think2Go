@@ -7,7 +7,7 @@ We unify supervised fine-tuning (SFT) and reinforcement learning (RL)-based reas
 ## Dataset
 We can prepare our SID dataset through the following link:
 ```sh
-git clone https://github.com/wds1996/GNPR-SID/tree/main/datasets
+git clone https://github.com/wds1996/GNPR-SID
 ```
 
 ## Supervised Fine-tuning
